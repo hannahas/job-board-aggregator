@@ -369,12 +369,17 @@ class JobBoardApp {
         const apps = this.loadApplicationStatus();
 
         // Support OR logic for all filters using pipe separator
-        const titleRegex = titleFilter 
-            ? new RegExp(
-                titleFilter.split('|').map(term => `\\b${this.escapeRegex(term.trim())}\\b`).join('|'), 
-                'i'
-              ) 
+        const titleTerms = titleFilter ? titleFilter.split('|').map(t => t.trim()).filter(Boolean) : [];
+        const titleInclude = titleTerms.filter(t => !t.startsWith('-'));
+        const titleExclude = titleTerms.filter(t => t.startsWith('-')).map(t => t.slice(1).trim());
+
+        const titleRegex = titleInclude.length
+            ? new RegExp(titleInclude.map(term => `\\b${this.escapeRegex(term)}\\b`).join('|'), 'i')
             : null;
+        const titleExcludeRegex = titleExclude.length
+            ? new RegExp(titleExclude.map(term => `\\b${this.escapeRegex(term)}\\b`).join('|'), 'i')
+            : null;
+
         const companyRegex = companyFilter 
             ? new RegExp(
                 companyFilter.split('|').map(term => `\\b${this.escapeRegex(term.trim())}\\b`).join('|'), 
@@ -431,11 +436,14 @@ class JobBoardApp {
                 }
             }
 
+            if (titleExcludeRegex && titleExcludeRegex.test(title)) return false;
+
             return (
                 (!titleRegex || titleRegex.test(title)) &&
                 (!companyRegex || companyRegex.test(company)) &&
                 (!locationRegex || locationRegex.test(location))
             );
+
         });
 
         // Apply current sort to filtered results
