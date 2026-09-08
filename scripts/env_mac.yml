@@ -1,0 +1,14 @@
+name: jobagg
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - numpy
+  - requests
+  - fuzzywuzzy
+  - python-levenshtein
+  - rapidfuzz
+  - ipykernel
+  - jupyter_client
+  - pip
