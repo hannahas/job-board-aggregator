@@ -79,12 +79,14 @@ class JobBoardApp {
                         'workday': 'warning',
                         'workdaysite': 'warning',
                         'ashby': 'info',
-                        'icms': 'secondary',
+                        'icims': 'secondary',
                         'generic': 'secondary',
                         'bamboohr': 'danger',
                         'workable': 'dark',
                         'oracle': 'info',
                         'smartrecruiters': 'danger',
+                        'clearcompany': 'success',
+                        'amazon': 'warning',
                         'unknown': 'primary'
                     }
                     const color = colors[ats.toLowerCase()] || 'light';

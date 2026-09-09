@@ -28,6 +28,9 @@ LEVER_FILE = os.path.join(ROOT_DIR, "data", "lever_companies.json")
 ORACLE_FILE = os.path.join(ROOT_DIR, "data", "oracle_companies.json")
 MISC_FILE = os.path.join(ROOT_DIR, "data", "misc_companies.json")
 SMARTRECRUITERS_FILE = os.path.join(ROOT_DIR, "data", "smartrecruiters_companies.json")
+ICIMS_FILE = os.path.join(ROOT_DIR, "data", "icims_companies.json")
+CLEARCOMPANY_FILE = os.path.join(ROOT_DIR, "data", "clearcompany_companies.json")
+AMAZON_FILE = os.path.join(ROOT_DIR, "data", "amazon_companies.json")
 
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -166,6 +169,49 @@ def fetch_company_jobs_greenhouse(slug):
     return slug, []
 
 
+# Skip per-job date enrichment above this many postings (keeps request count sane).
+ASHBY_MAX_DETAIL_FETCH = 400
+
+
+def _ashby_fetch_published_date(job):
+    """Read `publishedDate` for one Ashby posting into `job["updated_at"]`.
+
+    The board list query (ApiJobBoardWithTeams) only returns brief records with
+    no dates; the per-posting ApiJobPosting query exposes `publishedDate`.
+    Consumes the private "_ashby_org" / "_ashby_id" keys set by the caller.
+    """
+    org = job.pop("_ashby_org", None)
+    job_id = job.pop("_ashby_id", None)
+    if not org or not job_id:
+        return job
+    try:
+        resp = requests.post(
+            "https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobPosting",
+            json={
+                "operationName": "ApiJobPosting",
+                "variables": {
+                    "organizationHostedJobsPageName": org,
+                    "jobPostingId": job_id,
+                },
+                "query": "query ApiJobPosting($organizationHostedJobsPageName: String!, $jobPostingId: String!) { jobPosting(organizationHostedJobsPageName: $organizationHostedJobsPageName, jobPostingId: $jobPostingId) { id publishedDate } }",
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": random.choice(USER_AGENTS),
+            },
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            jp = (resp.json().get("data") or {}).get("jobPosting") or {}
+            posted = jp.get("publishedDate")
+            if posted:
+                job["updated_at"] = parse_relative_date(posted)
+    except Exception:
+        pass
+    return job
+
+
 def fetch_company_jobs_ashby(slug):
     try:
         url = f"https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobBoardWithTeams"
@@ -193,19 +239,29 @@ def fetch_company_jobs_ashby(slug):
                     location = job.get("locationName", "Not specified")
                     if not is_valid_location(location):
                         continue
-                    normalized.append(
-                        {
-                            "company": slug,
-                            "company_slug": slug,
-                            "title": job.get("title", ""),
-                            "location": location,
-                            "updated_at": None,
-                            "url": f"https://jobs.ashbyhq.com/{slug}/{job.get('id')}",
-                            "is_recruiter": is_recruiter_company(slug),
-                            "ats": "Ashby",
-                            **get_job_metadata()
-                        }
-                    )
+                    entry = {
+                        "company": slug,
+                        "company_slug": slug,
+                        "title": job.get("title", ""),
+                        "location": location,
+                        "updated_at": None,
+                        "url": f"https://jobs.ashbyhq.com/{slug}/{job.get('id')}",
+                        "is_recruiter": is_recruiter_company(slug),
+                        "ats": "Ashby",
+                        **get_job_metadata()
+                    }
+                    entry["_ashby_org"] = slug
+                    entry["_ashby_id"] = job.get("id")
+                    normalized.append(entry)
+
+                # The list query has no dates; pull `publishedDate` per posting.
+                if 0 < len(normalized) <= ASHBY_MAX_DETAIL_FETCH:
+                    with ThreadPoolExecutor(max_workers=8) as executor:
+                        list(executor.map(_ashby_fetch_published_date, normalized))
+                for entry in normalized:
+                    entry.pop("_ashby_org", None)
+                    entry.pop("_ashby_id", None)
+
                 return slug, normalized
     except Exception as e:
         pass
@@ -292,18 +348,57 @@ def fetch_company_jobs_lever(slug):
     return slug, []
 
 
+# Some Workday tenants (e.g. Vertex) omit `postedOn` from the jobs list; for
+# those we hit the per-job detail endpoint. Cap the per-company enrichment.
+WORKDAY_MAX_DETAIL_FETCH = 400
+
+
+def _workday_fetch_posted_date(args):
+    """Fetch one Workday job's detail record and read a date into updated_at.
+
+    Only called for entries whose list record had no `postedOn`. The detail
+    endpoint's jobPostingInfo carries `startDate` (ISO) and `postedOn`
+    (relative). Consumes the private "_wd_path" / "_wd_cxs" keys.
+    """
+    entry = args
+    path = entry.pop("_wd_path", None)
+    cxs_base = entry.pop("_wd_cxs", None)
+    if not path or not cxs_base:
+        return entry
+    try:
+        resp = requests.get(
+            f"{cxs_base}{path}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": random.choice(USER_AGENTS),
+            },
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            info = resp.json().get("jobPostingInfo") or {}
+            posted = info.get("startDate") or info.get("postedOn")
+            if posted:
+                entry["updated_at"] = parse_relative_date(posted)
+    except Exception:
+        pass
+    return entry
+
+
 def fetch_company_jobs_workday(slug):
     """
-    slug format: "company|wd#|site_id" e.g. "kohls|wd1|kohlscareers"
+    slug format: "company|wd#|site_id[|display_name]"
+      e.g. "kohls|wd1|kohlscareers"
+           "gh|wd1|gh|guardant"   (4th field overrides the board name shown/filtered on)
     url: https://{company}.wd{num}.myworkdayjobs.com/wday/cxs/{company}/{site_id}/jobs
     """
 
     try:
         parts = slug.split("|")
-        if len(parts) != 3:
+        if len(parts) not in (3, 4):
             return slug, []
 
-        company, wd, site_id = parts
+        company, wd, site_id = parts[:3]
+        display_name = parts[3].strip() if len(parts) == 4 and parts[3].strip() else company
         wd_num = wd.replace("wd", "")
 
         base_url = f"https://{company}.wd{wd_num}.myworkdayjobs.com"
@@ -319,11 +414,13 @@ def fetch_company_jobs_workday(slug):
         }
 
         normalized = []
+        seen_paths = set()
         offset = 0
         limit = 20
         retries = 0
         max_retries = 2
         observed_total = None
+        max_offset = 2500
 
         while True:
             payload = {
@@ -351,18 +448,26 @@ def fetch_company_jobs_workday(slug):
             jobs = data.get("jobPostings", [])
             total = data.get("total", 0)
 
-            # Detect silent blocking / truncation
-            if observed_total is None:
+            # Keep the FIRST advertised total as the stop bound. Some tenants
+            # (e.g. Vertex) zero out `total` after page 1 while still serving
+            # real, non-duplicate pages, so we no longer bail on a mismatch -
+            # the per-page dedup below is what stops an actually-blocked tenant
+            # that just loops the same page back at us.
+            if observed_total is None and total:
                 observed_total = total
-            elif total != observed_total:
-                # Workday sometimes lies mid-pagination when blocking
-                break
 
             if not jobs:
                 break
 
+            new_this_page = 0
             for job in jobs:
                 job_path = job.get("externalPath", "")
+                if job_path and job_path in seen_paths:
+                    continue
+                if job_path:
+                    seen_paths.add(job_path)
+                new_this_page += 1
+
                 # Get corrected date
                 posted_on = job.get("postedOn")
                 posted_on_parsed = parse_relative_date(posted_on)
@@ -370,30 +475,47 @@ def fetch_company_jobs_workday(slug):
                 location = job.get("locationsText", "Not specified")
                 if not is_valid_location(location):
                     continue
-                normalized.append(
-                    {
-                        "company": company,
-                        "company_slug": slug,
-                        "title": job.get("title"),
-                        "location": job.get("locationsText", "Not specified") [:50],
-                        "url": f"{career_url}{job_path}",
-                        "updated_at": posted_on_parsed,
-                        "is_recruiter": is_recruiter_company(company),
-                        "ats": "Workday",
-                        **get_job_metadata()
-                    }
-                )
-            # List possible queries from job
-            
+                entry = {
+                    "company": display_name,
+                    "company_slug": slug,
+                    "title": job.get("title"),
+                    "location": job.get("locationsText", "Not specified") [:50],
+                    "url": f"{career_url}{job_path}",
+                    "updated_at": posted_on_parsed,
+                    "is_recruiter": is_recruiter_company(company),
+                    "ats": "Workday",
+                    **get_job_metadata()
+                }
+                if posted_on_parsed is None and job_path:
+                    entry["_wd_path"] = job_path
+                    entry["_wd_cxs"] = f"{base_url}/wday/cxs/{company}/{site_id}"
+                normalized.append(entry)
+
+            # Nothing new on this page => caught up, or the tenant is looping
+            # / blocking. Either way, stop.
+            if new_this_page == 0:
+                break
+
             offset += limit
 
-            if offset >= total:
+            if observed_total and offset >= observed_total:
+                break
+            if offset >= max_offset:
                 break
 
             # Jitter between pages (critical)
             time.sleep(random.uniform(0.8, 1.8))
 
-        return company, normalized
+        # Backfill dates for tenants that don't return `postedOn` in the list.
+        undated = [e for e in normalized if e.get("_wd_path")]
+        if 0 < len(undated) <= WORKDAY_MAX_DETAIL_FETCH:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(_workday_fetch_posted_date, undated))
+        for e in normalized:
+            e.pop("_wd_path", None)
+            e.pop("_wd_cxs", None)
+
+        return display_name, normalized
 
     except Exception:
         return slug, []
@@ -804,9 +926,371 @@ def fetch_company_jobs_oracle(slug):
             )
             
         return company, normalized
-    
+
     except:
         return slug, []
+
+
+def _icims_format_location(raw):
+    """Turn iCIMS location strings like 'US-WA-Seattle' into 'Seattle, WA'."""
+    if not raw:
+        return "Not specified"
+    raw = re.sub(r"\s+", " ", raw).strip()
+    m = re.match(r"^([A-Za-z]{2})-([A-Za-z]{2})-(.+)$", raw)
+    if m:
+        _country, region, city = m.groups()
+        return f"{city.strip()}, {region.upper()}"
+    return raw
+
+
+# Skip per-job date enrichment above this many postings (keeps request count sane).
+ICIMS_MAX_DETAIL_FETCH = 750
+
+
+def _icims_fetch_posted_date(job):
+    """Fetch a single iCIMS job page and read `datePosted` from its JSON-LD block.
+
+    iCIMS omits any date from the search results list, so the posting date is
+    only available on the individual job page. Only the `?in_iframe=1` variant
+    of that page carries the JSON-LD block. Mutates `job["updated_at"]` in
+    place and returns `job` (so it can be used with Executor.map).
+    """
+    try:
+        response = requests.get(
+            job["url"] + "?in_iframe=1",
+            headers={
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            timeout=20,
+        )
+        if response.status_code == 200:
+            m = re.search(r'"datePosted"\s*:\s*"([^"]+)"', response.text)
+            if m:
+                job["updated_at"] = parse_relative_date(m.group(1))
+    except Exception:
+        pass
+    return job
+
+
+def fetch_company_jobs_icims(slug):
+    """
+    Fetch jobs from a public iCIMS careers portal.
+
+    slug format: "<subdomain>" or "<subdomain>|<search keyword>"
+      e.g. "careers-fhcrc"  ->  https://careers-fhcrc.icims.com
+           "careers-fhcrc|bioinformatics"
+
+    iCIMS renders its job list as server-side HTML at
+    https://{subdomain}.icims.com/jobs/search?ss=1&in_iframe=1&pr={page}
+    paginated via the 0-indexed `pr` query param. Each result row exposes a
+    title anchor (/jobs/{id}/{slug}/job), a job id, and a location cell.
+    """
+    try:
+        parts = slug.split("|")
+        subdomain = parts[0].strip()
+        keyword = parts[1].strip() if len(parts) > 1 else ""
+        if not subdomain:
+            return slug, []
+
+        base_url = f"https://{subdomain}.icims.com"
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+
+        # Each job row: <div class="col-xs-12 title"> ... <a href=".../jobs/ID/.../job..." title="ID - Title"> ... <h3>Title</h3> ...
+        # followed by <div class="col-xs-12 additionalFields"> ... Location</span></dt><dd ...><span >US-WA-Seattle</span>
+        row_re = re.compile(
+            r'<div class="col-xs-12 title">.*?<a[^>]+href="([^"]*?/jobs/(\d+)/[^"]*?)"[^>]*?>'
+            r'.*?<h3[^>]*>(.*?)</h3>.*?</a>'
+            r'(?P<rest>.*?)(?=<div class="col-xs-12 title">|<div class="pull-left">|\Z)',
+            re.S | re.I,
+        )
+        loc_re = re.compile(
+            r'Location\s*</span>\s*</dt>\s*<dd[^>]*>\s*<span[^>]*>(.*?)</span>', re.S | re.I
+        )
+        page_re = re.compile(r'Page\s+(\d+)\s+of\s+(\d+)', re.I)
+
+        normalized = []
+        seen_ids = set()
+        page = 0
+        max_pages = 25
+
+        while page < max_pages:
+            params = {"ss": 1, "in_iframe": 1, "pr": page}
+            if keyword:
+                params["searchKeyword"] = keyword
+
+            response = requests.get(
+                f"{base_url}/jobs/search", params=params, headers=headers, timeout=30
+            )
+            if response.status_code != 200:
+                break
+
+            html = response.text
+            new_on_page = 0
+
+            for m in row_re.finditer(html):
+                href, job_id, raw_title = m.group(1), m.group(2), m.group(3)
+                if job_id in seen_ids:
+                    continue
+                seen_ids.add(job_id)
+                new_on_page += 1
+
+                title = re.sub(r"<[^>]+>", "", raw_title or "")
+                title = re.sub(r"\s+", " ", title).replace("&ndash;", "-").strip()
+
+                loc_match = loc_re.search(m.group("rest") or "")
+                location = _icims_format_location(loc_match.group(1) if loc_match else "")
+                if not is_valid_location(location):
+                    continue
+
+                apply_url = urljoin(base_url, href).split("?")[0]
+
+                normalized.append(
+                    {
+                        "company": subdomain,
+                        "company_slug": subdomain,
+                        "title": title,
+                        "location": location[:50],
+                        "url": apply_url,
+                        "updated_at": None,
+                        "is_recruiter": is_recruiter_company(subdomain),
+                        "ats": "iCIMS",
+                        **get_job_metadata(),
+                    }
+                )
+
+            page_match = page_re.search(html)
+            if page_match:
+                current, total = int(page_match.group(1)), int(page_match.group(2))
+                if current >= total:
+                    break
+            elif new_on_page == 0:
+                break
+
+            page += 1
+            time.sleep(random.uniform(0.5, 1.2))
+
+        # The search list has no dates; pull `datePosted` from each job page.
+        if 0 < len(normalized) <= ICIMS_MAX_DETAIL_FETCH:
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                list(executor.map(_icims_fetch_posted_date, normalized))
+
+        return subdomain, normalized
+
+    except Exception:
+        return slug, []
+
+
+def _clearcompany_location(job):
+    """Build a 'City, ST' string from a ClearCompany job's locations array."""
+    locs = job.get("locations") or []
+    if locs:
+        loc = locs[0]
+        country = (loc.get("country") or "").strip()
+        if loc.get("isRemote"):
+            return f"Remote, {country}".strip(", ") or "Remote"
+        city = (loc.get("city") or "").strip()
+        region = (loc.get("subdivision") or "").strip()
+        if city and region:
+            return f"{city}, {region}"
+        if city and country:
+            return f"{city}, {country}"
+        if region and country:
+            return f"{region}, {country}"
+        return city or region or country or job.get("location") or "Not specified"
+    return (job.get("location") or "Not specified").strip()
+
+
+def fetch_company_jobs_clearcompany(slug):
+    """
+    Fetch jobs from a ClearCompany-hosted careers site.
+
+    slug format: "<name>|<siteId>"
+      e.g. "alleninstitute|f724f829-c8a2-8b32-a83b-2a479b88b77f"
+
+    The career-site widget reads from a public JSON API keyed by siteId:
+    https://careers-api.clearcompany.com/v1/{siteId}  ->
+        {"results": [...], "totalCount": N, "currentPageIndex": i}
+    Each result carries title, postedDate, locations and a full applyLink,
+    so no per-job request is needed. Paginated via pageIndex/pageSize.
+    """
+    try:
+        parts = slug.split("|")
+        if len(parts) != 2:
+            return slug, []
+        name, site_id = parts[0].strip(), parts[1].strip()
+        if not name or not site_id:
+            return slug, []
+
+        api_url = f"https://careers-api.clearcompany.com/v1/{site_id}"
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": random.choice(USER_AGENTS),
+        }
+
+        normalized = []
+        page_index = 0
+        page_size = 100
+        max_pages = 25
+
+        while page_index < max_pages:
+            response = requests.get(
+                api_url,
+                params={"pageIndex": page_index, "pageSize": page_size},
+                headers=headers,
+                timeout=30,
+            )
+            if response.status_code != 200:
+                break
+
+            data = response.json()
+            results = data.get("results", [])
+            if not results:
+                break
+
+            for job in results:
+                location = _clearcompany_location(job)
+                if not is_valid_location(location):
+                    continue
+
+                posted_on = job.get("postedDate") or job.get("openDate")
+                dept = job.get("departmentName") or job.get("officeName") or ""
+
+                normalized.append(
+                    {
+                        "company": name,
+                        "company_slug": name,
+                        "title": job.get("positionTitle"),
+                        "location": location[:50],
+                        "url": job.get("applyLink"),
+                        "updated_at": parse_relative_date(posted_on) if posted_on else None,
+                        "departments": [dept] if dept else [],
+                        "is_recruiter": is_recruiter_company(name),
+                        "ats": "ClearCompany",
+                        **get_job_metadata(),
+                    }
+                )
+
+            total = data.get("totalCount", 0)
+            if len(results) < page_size or (total and (page_index + 1) * page_size >= total):
+                break
+            page_index += 1
+            time.sleep(random.uniform(0.4, 1.0))
+
+        return name, normalized
+
+    except Exception:
+        return slug, []
+
+
+def _amazon_parse_date(s):
+    """Parse amazon.jobs `posted_date` like 'August 31, 2026' (note: it can
+    contain a double space before a single-digit day)."""
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        cleaned = re.sub(r"\s+", " ", s).strip()
+        return datetime.strptime(cleaned, "%B %d, %Y").astimezone().isoformat()
+    except Exception:
+        return None
+
+
+def fetch_company_jobs_amazon(slug):
+    """
+    Fetch jobs from Amazon's public careers API (amazon.jobs).
+
+    slug format: "amazon|<base_query>[|<title_suffix>]"
+      e.g. "amazon|special projects|special projects"
+           "amazon|bioinformatics"
+
+    Amazon has 10k+ open reqs, so `base_query` (free-text, loosely OR-matched)
+    is required to scope the pull. `title_suffix`, if given, further keeps only
+    jobs whose title *ends with* that phrase (case-insensitive) - Amazon names
+    org teams as a title suffix (", Special Projects"), and this trims the
+    loose-match noise the search returns.
+    """
+    try:
+        parts = slug.split("|")
+        if len(parts) < 2 or not parts[1].strip():
+            return slug, []
+        name = parts[0].strip() or "amazon"
+        base_query = parts[1].strip()
+        title_suffix = parts[2].strip().lower() if len(parts) > 2 and parts[2].strip() else None
+
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": random.choice(USER_AGENTS),
+        }
+
+        normalized = []
+        seen = set()
+        offset = 0
+        page_size = 100
+        max_pages = 20
+
+        for _ in range(max_pages):
+            resp = requests.get(
+                "https://amazon.jobs/en/search.json",
+                params={
+                    "base_query": base_query,
+                    "result_limit": page_size,
+                    "offset": offset,
+                    "sort": "recent",
+                },
+                headers=headers,
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                break
+
+            data = resp.json()
+            jobs = data.get("jobs", [])
+            total = data.get("hits", 0)
+            if not jobs:
+                break
+
+            for job in jobs:
+                job_id = job.get("id_icims") or job.get("job_path")
+                if job_id in seen:
+                    continue
+                seen.add(job_id)
+
+                title = (job.get("title") or "").strip()
+                if title_suffix and not title.lower().endswith(title_suffix):
+                    continue
+
+                location = job.get("normalized_location") or job.get("location") or "Not specified"
+                if not is_valid_location(location):
+                    continue
+
+                job_path = job.get("job_path") or ""
+                normalized.append(
+                    {
+                        "company": name,
+                        "company_slug": name,
+                        "title": title,
+                        "location": location[:50],
+                        "url": f"https://amazon.jobs{job_path}",
+                        "updated_at": _amazon_parse_date(job.get("posted_date")),
+                        "is_recruiter": is_recruiter_company(name),
+                        "ats": "Amazon",
+                        **get_job_metadata(),
+                    }
+                )
+
+            offset += page_size
+            if offset >= total or len(jobs) < page_size:
+                break
+            time.sleep(random.uniform(0.4, 1.0))
+
+        return name, normalized
+
+    except Exception:
+        return slug, []
+
 
 def fetch_all_jobs(companies, fetcher, platform="ATS"):
     """Fetch jobs from all companies in parallel."""
@@ -1081,25 +1565,38 @@ def get_nordic_location_patterns() -> Set[str]:
 
 def is_valid_location(location: str) -> bool:
     """
-    Check if a location string matches US, Canada, Denmark, Norway, or Sweden.
-    
-    Args:
-        location (str): Location string from job posting
-        
-    Returns:
-        bool: True if location is in target countries, False otherwise
+    Return True for any non-empty location string.
+
+    The board used to restrict jobs to US / Canada / Denmark / Norway / Sweden
+    here, but that geographic gate has been removed so roles everywhere are
+    shown (many are remote-eligible regardless of the posted city). Narrowing
+    by location now happens client-side via the UI's Location / Remote filters.
+
+    Still rejects empty / missing / non-string values so the "no location"
+    cleanup and the generic scraper's candidate-picking keep working.
+
+    The `_geo_match_location()` helper and the pattern tables below are kept
+    for reference and easy reinstatement.
     """
     if not location or not isinstance(location, str):
         return False
-    
+    return True
+
+
+def _geo_match_location(location: str) -> bool:
+    """Legacy US/Canada/Nordic allow-list check. No longer called by default;
+    see is_valid_location()."""
+    if not location or not isinstance(location, str):
+        return False
+
     # Normalize the location string
     normalized = location.lower().strip()
-    
+
     # Get all valid patterns
     us_patterns = get_us_location_patterns()
     nordic_patterns = get_nordic_location_patterns()
     all_patterns = us_patterns | nordic_patterns
-    
+
     # Check for exact matches first (handles "DE", "US", etc.)
     # Split by common separators and check each part
     parts = re.split(r'[-,/\s]+', normalized)
@@ -1107,7 +1604,7 @@ def is_valid_location(location: str) -> bool:
         part = part.strip()
         if part in all_patterns:
             return True
-    
+
     # Check if any pattern is contained in the location string
     # This handles formats like "Boston, MA" or "Remote - United States"
     for pattern in all_patterns:
@@ -1121,7 +1618,7 @@ def is_valid_location(location: str) -> bool:
             # For longer patterns, simple substring matching is fine
             if pattern in normalized:
                 return True
-    
+
     return False
 
 def clean_job_data(jobs):
@@ -1220,7 +1717,7 @@ def save_results(all_companies, active_companies, all_jobs):
         "total_jobs": len(all_jobs),
         "recruiter_jobs": recruiter_jobs,
         "source_type": SOURCE_TYPE,
-        "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, workdaysite_api, oracle_api, smartrecruiters_api, generic_html_scraper",
+        "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, workdaysite_api, oracle_api, smartrecruiters_api, icims_html_scraper, clearcompany_api, amazon_jobs_api, generic_html_scraper",
     }
 
     metadata_file = os.path.join(OUTPUT_DIR, "metadata.json")
@@ -1252,7 +1749,10 @@ def main():
     oracle_companies = load_companies(ORACLE_FILE)
     misc_companies = load_companies(MISC_FILE)
     smartrecruiters_companies = load_companies(SMARTRECRUITERS_FILE)
-    
+    icims_companies = load_companies(ICIMS_FILE)
+    clearcompany_companies = load_companies(CLEARCOMPANY_FILE)
+    amazon_companies = load_companies(AMAZON_FILE)
+
     if (
         not greenhouse_companies
         and not ashby_companies
@@ -1263,6 +1763,9 @@ def main():
         and not oracle_companies
         and not misc_companies
         and not smartrecruiters_companies
+        and not icims_companies
+        and not clearcompany_companies
+        and not amazon_companies
     ):
         print("Exiting - no companies loaded!")
         return
@@ -1286,6 +1789,12 @@ def main():
 
     active_smartrecruiters, jobs_smartrecruiters = fetch_all_jobs(smartrecruiters_companies, fetch_company_jobs_smartrecruiters, "SMARTRECRUITERS")
 
+    active_icims, jobs_icims = fetch_all_jobs(icims_companies, fetch_company_jobs_icims, "ICIMS")
+
+    active_clearcompany, jobs_clearcompany = fetch_all_jobs(clearcompany_companies, fetch_company_jobs_clearcompany, "CLEARCOMPANY")
+
+    active_amazon, jobs_amazon = fetch_all_jobs(amazon_companies, fetch_company_jobs_amazon, "AMAZON")
+
     # Combine results
     all_companies = (
         greenhouse_companies
@@ -1297,6 +1806,9 @@ def main():
         | oracle_companies
         | misc_companies
         | smartrecruiters_companies
+        | icims_companies
+        | clearcompany_companies
+        | amazon_companies
     )
     all_active_companies = {
         **active_greenhouse,
@@ -1308,8 +1820,11 @@ def main():
         **active_oracle,
         **active_misc,
         **active_smartrecruiters,
+        **active_icims,
+        **active_clearcompany,
+        **active_amazon,
     }
-    all_jobs_OG = jobs_greenhouse + jobs_ashby + jobs_bamboohr + jobs_lever + jobs_workday + jobs_workdaysite + jobs_oracle + jobs_misc + jobs_smartrecruiters
+    all_jobs_OG = jobs_greenhouse + jobs_ashby + jobs_bamboohr + jobs_lever + jobs_workday + jobs_workdaysite + jobs_oracle + jobs_misc + jobs_smartrecruiters + jobs_icims + jobs_clearcompany + jobs_amazon
     all_jobs = []
     
     # Filter all_jobs to include only jobs from the last 30 days
@@ -1342,9 +1857,9 @@ if __name__ == "__main__":
                        choices=['automated', 'manual'], 
                        default='automated',
                        help='Source type: automated (GitHub Actions) or manual (local run)')
-    parser.add_argument('--within', 
-                       default=30,
-                       help='What should the date filter be; default=30. (within "30" days)')
+    parser.add_argument('--within',
+                       default=120,
+                       help='Max age (in days) of a job posting to include; default=120.')
 
     args = parser.parse_args()
     SOURCE_TYPE = args.source
