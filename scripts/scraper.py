@@ -29,6 +29,7 @@ ORACLE_FILE = os.path.join(ROOT_DIR, "data", "oracle_companies.json")
 MISC_FILE = os.path.join(ROOT_DIR, "data", "misc_companies.json")
 SMARTRECRUITERS_FILE = os.path.join(ROOT_DIR, "data", "smartrecruiters_companies.json")
 ICIMS_FILE = os.path.join(ROOT_DIR, "data", "icims_companies.json")
+CLEARCOMPANY_FILE = os.path.join(ROOT_DIR, "data", "clearcompany_companies.json")
 
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -963,6 +964,108 @@ def fetch_company_jobs_icims(slug):
         return slug, []
 
 
+def _clearcompany_location(job):
+    """Build a 'City, ST' string from a ClearCompany job's locations array."""
+    locs = job.get("locations") or []
+    if locs:
+        loc = locs[0]
+        country = (loc.get("country") or "").strip()
+        if loc.get("isRemote"):
+            return f"Remote, {country}".strip(", ") or "Remote"
+        city = (loc.get("city") or "").strip()
+        region = (loc.get("subdivision") or "").strip()
+        if city and region:
+            return f"{city}, {region}"
+        if city and country:
+            return f"{city}, {country}"
+        if region and country:
+            return f"{region}, {country}"
+        return city or region or country or job.get("location") or "Not specified"
+    return (job.get("location") or "Not specified").strip()
+
+
+def fetch_company_jobs_clearcompany(slug):
+    """
+    Fetch jobs from a ClearCompany-hosted careers site.
+
+    slug format: "<name>|<siteId>"
+      e.g. "alleninstitute|f724f829-c8a2-8b32-a83b-2a479b88b77f"
+
+    The career-site widget reads from a public JSON API keyed by siteId:
+    https://careers-api.clearcompany.com/v1/{siteId}  ->
+        {"results": [...], "totalCount": N, "currentPageIndex": i}
+    Each result carries title, postedDate, locations and a full applyLink,
+    so no per-job request is needed. Paginated via pageIndex/pageSize.
+    """
+    try:
+        parts = slug.split("|")
+        if len(parts) != 2:
+            return slug, []
+        name, site_id = parts[0].strip(), parts[1].strip()
+        if not name or not site_id:
+            return slug, []
+
+        api_url = f"https://careers-api.clearcompany.com/v1/{site_id}"
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": random.choice(USER_AGENTS),
+        }
+
+        normalized = []
+        page_index = 0
+        page_size = 100
+        max_pages = 25
+
+        while page_index < max_pages:
+            response = requests.get(
+                api_url,
+                params={"pageIndex": page_index, "pageSize": page_size},
+                headers=headers,
+                timeout=30,
+            )
+            if response.status_code != 200:
+                break
+
+            data = response.json()
+            results = data.get("results", [])
+            if not results:
+                break
+
+            for job in results:
+                location = _clearcompany_location(job)
+                if not is_valid_location(location):
+                    continue
+
+                posted_on = job.get("postedDate") or job.get("openDate")
+                dept = job.get("departmentName") or job.get("officeName") or ""
+
+                normalized.append(
+                    {
+                        "company": name,
+                        "company_slug": name,
+                        "title": job.get("positionTitle"),
+                        "location": location[:50],
+                        "url": job.get("applyLink"),
+                        "updated_at": parse_relative_date(posted_on) if posted_on else None,
+                        "departments": [dept] if dept else [],
+                        "is_recruiter": is_recruiter_company(name),
+                        "ats": "ClearCompany",
+                        **get_job_metadata(),
+                    }
+                )
+
+            total = data.get("totalCount", 0)
+            if len(results) < page_size or (total and (page_index + 1) * page_size >= total):
+                break
+            page_index += 1
+            time.sleep(random.uniform(0.4, 1.0))
+
+        return name, normalized
+
+    except Exception:
+        return slug, []
+
+
 def fetch_all_jobs(companies, fetcher, platform="ATS"):
     """Fetch jobs from all companies in parallel."""
     print("=" * 80)
@@ -1375,7 +1478,7 @@ def save_results(all_companies, active_companies, all_jobs):
         "total_jobs": len(all_jobs),
         "recruiter_jobs": recruiter_jobs,
         "source_type": SOURCE_TYPE,
-        "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, workdaysite_api, oracle_api, smartrecruiters_api, icims_html_scraper, generic_html_scraper",
+        "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, workdaysite_api, oracle_api, smartrecruiters_api, icims_html_scraper, clearcompany_api, generic_html_scraper",
     }
 
     metadata_file = os.path.join(OUTPUT_DIR, "metadata.json")
@@ -1408,6 +1511,7 @@ def main():
     misc_companies = load_companies(MISC_FILE)
     smartrecruiters_companies = load_companies(SMARTRECRUITERS_FILE)
     icims_companies = load_companies(ICIMS_FILE)
+    clearcompany_companies = load_companies(CLEARCOMPANY_FILE)
 
     if (
         not greenhouse_companies
@@ -1420,6 +1524,7 @@ def main():
         and not misc_companies
         and not smartrecruiters_companies
         and not icims_companies
+        and not clearcompany_companies
     ):
         print("Exiting - no companies loaded!")
         return
@@ -1445,6 +1550,8 @@ def main():
 
     active_icims, jobs_icims = fetch_all_jobs(icims_companies, fetch_company_jobs_icims, "ICIMS")
 
+    active_clearcompany, jobs_clearcompany = fetch_all_jobs(clearcompany_companies, fetch_company_jobs_clearcompany, "CLEARCOMPANY")
+
     # Combine results
     all_companies = (
         greenhouse_companies
@@ -1457,6 +1564,7 @@ def main():
         | misc_companies
         | smartrecruiters_companies
         | icims_companies
+        | clearcompany_companies
     )
     all_active_companies = {
         **active_greenhouse,
@@ -1469,8 +1577,9 @@ def main():
         **active_misc,
         **active_smartrecruiters,
         **active_icims,
+        **active_clearcompany,
     }
-    all_jobs_OG = jobs_greenhouse + jobs_ashby + jobs_bamboohr + jobs_lever + jobs_workday + jobs_workdaysite + jobs_oracle + jobs_misc + jobs_smartrecruiters + jobs_icims
+    all_jobs_OG = jobs_greenhouse + jobs_ashby + jobs_bamboohr + jobs_lever + jobs_workday + jobs_workdaysite + jobs_oracle + jobs_misc + jobs_smartrecruiters + jobs_icims + jobs_clearcompany
     all_jobs = []
     
     # Filter all_jobs to include only jobs from the last 30 days

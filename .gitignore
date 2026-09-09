@@ -56,6 +56,7 @@ scripts/output/
 !data/oracle_companies.json
 !data/smartrecruiters_companies.json
 !data/icims_companies.json
+!data/clearcompany_companies.json
 
 # Allow gzip files in data/ only
 !data/*.gz
