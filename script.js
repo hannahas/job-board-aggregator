@@ -79,7 +79,7 @@ class JobBoardApp {
                         'workday': 'warning',
                         'workdaysite': 'warning',
                         'ashby': 'info',
-                        'icms': 'secondary',
+                        'icims': 'secondary',
                         'generic': 'secondary',
                         'bamboohr': 'danger',
                         'workable': 'dark',

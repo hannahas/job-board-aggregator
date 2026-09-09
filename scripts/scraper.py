@@ -28,6 +28,7 @@ LEVER_FILE = os.path.join(ROOT_DIR, "data", "lever_companies.json")
 ORACLE_FILE = os.path.join(ROOT_DIR, "data", "oracle_companies.json")
 MISC_FILE = os.path.join(ROOT_DIR, "data", "misc_companies.json")
 SMARTRECRUITERS_FILE = os.path.join(ROOT_DIR, "data", "smartrecruiters_companies.json")
+ICIMS_FILE = os.path.join(ROOT_DIR, "data", "icims_companies.json")
 
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -804,9 +805,128 @@ def fetch_company_jobs_oracle(slug):
             )
             
         return company, normalized
-    
+
     except:
         return slug, []
+
+
+def _icims_format_location(raw):
+    """Turn iCIMS location strings like 'US-WA-Seattle' into 'Seattle, WA'."""
+    if not raw:
+        return "Not specified"
+    raw = re.sub(r"\s+", " ", raw).strip()
+    m = re.match(r"^([A-Za-z]{2})-([A-Za-z]{2})-(.+)$", raw)
+    if m:
+        _country, region, city = m.groups()
+        return f"{city.strip()}, {region.upper()}"
+    return raw
+
+
+def fetch_company_jobs_icims(slug):
+    """
+    Fetch jobs from a public iCIMS careers portal.
+
+    slug format: "<subdomain>" or "<subdomain>|<search keyword>"
+      e.g. "careers-fhcrc"  ->  https://careers-fhcrc.icims.com
+           "careers-fhcrc|bioinformatics"
+
+    iCIMS renders its job list as server-side HTML at
+    https://{subdomain}.icims.com/jobs/search?ss=1&in_iframe=1&pr={page}
+    paginated via the 0-indexed `pr` query param. Each result row exposes a
+    title anchor (/jobs/{id}/{slug}/job), a job id, and a location cell.
+    """
+    try:
+        parts = slug.split("|")
+        subdomain = parts[0].strip()
+        keyword = parts[1].strip() if len(parts) > 1 else ""
+        if not subdomain:
+            return slug, []
+
+        base_url = f"https://{subdomain}.icims.com"
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+
+        # Each job row: <div class="col-xs-12 title"> ... <a href=".../jobs/ID/.../job..." title="ID - Title"> ... <h3>Title</h3> ...
+        # followed by <div class="col-xs-12 additionalFields"> ... Location</span></dt><dd ...><span >US-WA-Seattle</span>
+        row_re = re.compile(
+            r'<div class="col-xs-12 title">.*?<a[^>]+href="([^"]*?/jobs/(\d+)/[^"]*?)"[^>]*?>'
+            r'.*?<h3[^>]*>(.*?)</h3>.*?</a>'
+            r'(?P<rest>.*?)(?=<div class="col-xs-12 title">|<div class="pull-left">|\Z)',
+            re.S | re.I,
+        )
+        loc_re = re.compile(
+            r'Location\s*</span>\s*</dt>\s*<dd[^>]*>\s*<span[^>]*>(.*?)</span>', re.S | re.I
+        )
+        page_re = re.compile(r'Page\s+(\d+)\s+of\s+(\d+)', re.I)
+
+        normalized = []
+        seen_ids = set()
+        page = 0
+        max_pages = 25
+
+        while page < max_pages:
+            params = {"ss": 1, "in_iframe": 1, "pr": page}
+            if keyword:
+                params["searchKeyword"] = keyword
+
+            response = requests.get(
+                f"{base_url}/jobs/search", params=params, headers=headers, timeout=30
+            )
+            if response.status_code != 200:
+                break
+
+            html = response.text
+            new_on_page = 0
+
+            for m in row_re.finditer(html):
+                href, job_id, raw_title = m.group(1), m.group(2), m.group(3)
+                if job_id in seen_ids:
+                    continue
+                seen_ids.add(job_id)
+                new_on_page += 1
+
+                title = re.sub(r"<[^>]+>", "", raw_title or "")
+                title = re.sub(r"\s+", " ", title).replace("&ndash;", "-").strip()
+
+                loc_match = loc_re.search(m.group("rest") or "")
+                location = _icims_format_location(loc_match.group(1) if loc_match else "")
+                if not is_valid_location(location):
+                    continue
+
+                apply_url = urljoin(base_url, href).split("?")[0]
+
+                normalized.append(
+                    {
+                        "company": subdomain,
+                        "company_slug": subdomain,
+                        "title": title,
+                        "location": location[:50],
+                        "url": apply_url,
+                        "updated_at": None,
+                        "is_recruiter": is_recruiter_company(subdomain),
+                        "ats": "iCIMS",
+                        **get_job_metadata(),
+                    }
+                )
+
+            page_match = page_re.search(html)
+            if page_match:
+                current, total = int(page_match.group(1)), int(page_match.group(2))
+                if current >= total:
+                    break
+            elif new_on_page == 0:
+                break
+
+            page += 1
+            time.sleep(random.uniform(0.5, 1.2))
+
+        return subdomain, normalized
+
+    except Exception:
+        return slug, []
+
 
 def fetch_all_jobs(companies, fetcher, platform="ATS"):
     """Fetch jobs from all companies in parallel."""
@@ -1220,7 +1340,7 @@ def save_results(all_companies, active_companies, all_jobs):
         "total_jobs": len(all_jobs),
         "recruiter_jobs": recruiter_jobs,
         "source_type": SOURCE_TYPE,
-        "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, workdaysite_api, oracle_api, smartrecruiters_api, generic_html_scraper",
+        "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, workdaysite_api, oracle_api, smartrecruiters_api, icims_html_scraper, generic_html_scraper",
     }
 
     metadata_file = os.path.join(OUTPUT_DIR, "metadata.json")
@@ -1252,7 +1372,8 @@ def main():
     oracle_companies = load_companies(ORACLE_FILE)
     misc_companies = load_companies(MISC_FILE)
     smartrecruiters_companies = load_companies(SMARTRECRUITERS_FILE)
-    
+    icims_companies = load_companies(ICIMS_FILE)
+
     if (
         not greenhouse_companies
         and not ashby_companies
@@ -1263,6 +1384,7 @@ def main():
         and not oracle_companies
         and not misc_companies
         and not smartrecruiters_companies
+        and not icims_companies
     ):
         print("Exiting - no companies loaded!")
         return
@@ -1286,6 +1408,8 @@ def main():
 
     active_smartrecruiters, jobs_smartrecruiters = fetch_all_jobs(smartrecruiters_companies, fetch_company_jobs_smartrecruiters, "SMARTRECRUITERS")
 
+    active_icims, jobs_icims = fetch_all_jobs(icims_companies, fetch_company_jobs_icims, "ICIMS")
+
     # Combine results
     all_companies = (
         greenhouse_companies
@@ -1297,6 +1421,7 @@ def main():
         | oracle_companies
         | misc_companies
         | smartrecruiters_companies
+        | icims_companies
     )
     all_active_companies = {
         **active_greenhouse,
@@ -1308,8 +1433,9 @@ def main():
         **active_oracle,
         **active_misc,
         **active_smartrecruiters,
+        **active_icims,
     }
-    all_jobs_OG = jobs_greenhouse + jobs_ashby + jobs_bamboohr + jobs_lever + jobs_workday + jobs_workdaysite + jobs_oracle + jobs_misc + jobs_smartrecruiters
+    all_jobs_OG = jobs_greenhouse + jobs_ashby + jobs_bamboohr + jobs_lever + jobs_workday + jobs_workdaysite + jobs_oracle + jobs_misc + jobs_smartrecruiters + jobs_icims
     all_jobs = []
     
     # Filter all_jobs to include only jobs from the last 30 days
