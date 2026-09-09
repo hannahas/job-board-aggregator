@@ -1339,25 +1339,38 @@ def get_nordic_location_patterns() -> Set[str]:
 
 def is_valid_location(location: str) -> bool:
     """
-    Check if a location string matches US, Canada, Denmark, Norway, or Sweden.
-    
-    Args:
-        location (str): Location string from job posting
-        
-    Returns:
-        bool: True if location is in target countries, False otherwise
+    Return True for any non-empty location string.
+
+    The board used to restrict jobs to US / Canada / Denmark / Norway / Sweden
+    here, but that geographic gate has been removed so roles everywhere are
+    shown (many are remote-eligible regardless of the posted city). Narrowing
+    by location now happens client-side via the UI's Location / Remote filters.
+
+    Still rejects empty / missing / non-string values so the "no location"
+    cleanup and the generic scraper's candidate-picking keep working.
+
+    The `_geo_match_location()` helper and the pattern tables below are kept
+    for reference and easy reinstatement.
     """
     if not location or not isinstance(location, str):
         return False
-    
+    return True
+
+
+def _geo_match_location(location: str) -> bool:
+    """Legacy US/Canada/Nordic allow-list check. No longer called by default;
+    see is_valid_location()."""
+    if not location or not isinstance(location, str):
+        return False
+
     # Normalize the location string
     normalized = location.lower().strip()
-    
+
     # Get all valid patterns
     us_patterns = get_us_location_patterns()
     nordic_patterns = get_nordic_location_patterns()
     all_patterns = us_patterns | nordic_patterns
-    
+
     # Check for exact matches first (handles "DE", "US", etc.)
     # Split by common separators and check each part
     parts = re.split(r'[-,/\s]+', normalized)
@@ -1365,7 +1378,7 @@ def is_valid_location(location: str) -> bool:
         part = part.strip()
         if part in all_patterns:
             return True
-    
+
     # Check if any pattern is contained in the location string
     # This handles formats like "Boston, MA" or "Remote - United States"
     for pattern in all_patterns:
@@ -1379,7 +1392,7 @@ def is_valid_location(location: str) -> bool:
             # For longer patterns, simple substring matching is fine
             if pattern in normalized:
                 return True
-    
+
     return False
 
 def clean_job_data(jobs):
