@@ -32,6 +32,8 @@ $ python3 scripts/merge_data.py
 $ python -m http.server 8000
 ```  
 
+The scraper keeps postings up to 120 days old (`--within 120` is the default); pass a smaller/larger value to narrow or widen that window.  
+
 <br>
 
 ## Features  

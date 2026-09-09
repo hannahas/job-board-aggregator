@@ -822,6 +822,36 @@ def _icims_format_location(raw):
     return raw
 
 
+# Skip per-job date enrichment above this many postings (keeps request count sane).
+ICIMS_MAX_DETAIL_FETCH = 750
+
+
+def _icims_fetch_posted_date(job):
+    """Fetch a single iCIMS job page and read `datePosted` from its JSON-LD block.
+
+    iCIMS omits any date from the search results list, so the posting date is
+    only available on the individual job page. Only the `?in_iframe=1` variant
+    of that page carries the JSON-LD block. Mutates `job["updated_at"]` in
+    place and returns `job` (so it can be used with Executor.map).
+    """
+    try:
+        response = requests.get(
+            job["url"] + "?in_iframe=1",
+            headers={
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            timeout=20,
+        )
+        if response.status_code == 200:
+            m = re.search(r'"datePosted"\s*:\s*"([^"]+)"', response.text)
+            if m:
+                job["updated_at"] = parse_relative_date(m.group(1))
+    except Exception:
+        pass
+    return job
+
+
 def fetch_company_jobs_icims(slug):
     """
     Fetch jobs from a public iCIMS careers portal.
@@ -921,6 +951,11 @@ def fetch_company_jobs_icims(slug):
 
             page += 1
             time.sleep(random.uniform(0.5, 1.2))
+
+        # The search list has no dates; pull `datePosted` from each job page.
+        if 0 < len(normalized) <= ICIMS_MAX_DETAIL_FETCH:
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                list(executor.map(_icims_fetch_posted_date, normalized))
 
         return subdomain, normalized
 
@@ -1468,9 +1503,9 @@ if __name__ == "__main__":
                        choices=['automated', 'manual'], 
                        default='automated',
                        help='Source type: automated (GitHub Actions) or manual (local run)')
-    parser.add_argument('--within', 
-                       default=30,
-                       help='What should the date filter be; default=30. (within "30" days)')
+    parser.add_argument('--within',
+                       default=120,
+                       help='Max age (in days) of a job posting to include; default=120.')
 
     args = parser.parse_args()
     SOURCE_TYPE = args.source
