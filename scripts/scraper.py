@@ -414,11 +414,13 @@ def fetch_company_jobs_workday(slug):
         }
 
         normalized = []
+        seen_paths = set()
         offset = 0
         limit = 20
         retries = 0
         max_retries = 2
         observed_total = None
+        max_offset = 2500
 
         while True:
             payload = {
@@ -446,18 +448,26 @@ def fetch_company_jobs_workday(slug):
             jobs = data.get("jobPostings", [])
             total = data.get("total", 0)
 
-            # Detect silent blocking / truncation
-            if observed_total is None:
+            # Keep the FIRST advertised total as the stop bound. Some tenants
+            # (e.g. Vertex) zero out `total` after page 1 while still serving
+            # real, non-duplicate pages, so we no longer bail on a mismatch -
+            # the per-page dedup below is what stops an actually-blocked tenant
+            # that just loops the same page back at us.
+            if observed_total is None and total:
                 observed_total = total
-            elif total != observed_total:
-                # Workday sometimes lies mid-pagination when blocking
-                break
 
             if not jobs:
                 break
 
+            new_this_page = 0
             for job in jobs:
                 job_path = job.get("externalPath", "")
+                if job_path and job_path in seen_paths:
+                    continue
+                if job_path:
+                    seen_paths.add(job_path)
+                new_this_page += 1
+
                 # Get corrected date
                 posted_on = job.get("postedOn")
                 posted_on_parsed = parse_relative_date(posted_on)
@@ -480,11 +490,17 @@ def fetch_company_jobs_workday(slug):
                     entry["_wd_path"] = job_path
                     entry["_wd_cxs"] = f"{base_url}/wday/cxs/{company}/{site_id}"
                 normalized.append(entry)
-            # List possible queries from job
+
+            # Nothing new on this page => caught up, or the tenant is looping
+            # / blocking. Either way, stop.
+            if new_this_page == 0:
+                break
 
             offset += limit
 
-            if offset >= total:
+            if observed_total and offset >= observed_total:
+                break
+            if offset >= max_offset:
                 break
 
             # Jitter between pages (critical)
