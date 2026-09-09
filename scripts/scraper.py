@@ -30,6 +30,7 @@ MISC_FILE = os.path.join(ROOT_DIR, "data", "misc_companies.json")
 SMARTRECRUITERS_FILE = os.path.join(ROOT_DIR, "data", "smartrecruiters_companies.json")
 ICIMS_FILE = os.path.join(ROOT_DIR, "data", "icims_companies.json")
 CLEARCOMPANY_FILE = os.path.join(ROOT_DIR, "data", "clearcompany_companies.json")
+AMAZON_FILE = os.path.join(ROOT_DIR, "data", "amazon_companies.json")
 
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -1122,6 +1123,112 @@ def fetch_company_jobs_clearcompany(slug):
         return slug, []
 
 
+def _amazon_parse_date(s):
+    """Parse amazon.jobs `posted_date` like 'August 31, 2026' (note: it can
+    contain a double space before a single-digit day)."""
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        cleaned = re.sub(r"\s+", " ", s).strip()
+        return datetime.strptime(cleaned, "%B %d, %Y").astimezone().isoformat()
+    except Exception:
+        return None
+
+
+def fetch_company_jobs_amazon(slug):
+    """
+    Fetch jobs from Amazon's public careers API (amazon.jobs).
+
+    slug format: "amazon|<base_query>[|<title_suffix>]"
+      e.g. "amazon|special projects|special projects"
+           "amazon|bioinformatics"
+
+    Amazon has 10k+ open reqs, so `base_query` (free-text, loosely OR-matched)
+    is required to scope the pull. `title_suffix`, if given, further keeps only
+    jobs whose title *ends with* that phrase (case-insensitive) - Amazon names
+    org teams as a title suffix (", Special Projects"), and this trims the
+    loose-match noise the search returns.
+    """
+    try:
+        parts = slug.split("|")
+        if len(parts) < 2 or not parts[1].strip():
+            return slug, []
+        name = parts[0].strip() or "amazon"
+        base_query = parts[1].strip()
+        title_suffix = parts[2].strip().lower() if len(parts) > 2 and parts[2].strip() else None
+
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": random.choice(USER_AGENTS),
+        }
+
+        normalized = []
+        seen = set()
+        offset = 0
+        page_size = 100
+        max_pages = 20
+
+        for _ in range(max_pages):
+            resp = requests.get(
+                "https://amazon.jobs/en/search.json",
+                params={
+                    "base_query": base_query,
+                    "result_limit": page_size,
+                    "offset": offset,
+                    "sort": "recent",
+                },
+                headers=headers,
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                break
+
+            data = resp.json()
+            jobs = data.get("jobs", [])
+            total = data.get("hits", 0)
+            if not jobs:
+                break
+
+            for job in jobs:
+                job_id = job.get("id_icims") or job.get("job_path")
+                if job_id in seen:
+                    continue
+                seen.add(job_id)
+
+                title = (job.get("title") or "").strip()
+                if title_suffix and not title.lower().endswith(title_suffix):
+                    continue
+
+                location = job.get("normalized_location") or job.get("location") or "Not specified"
+                if not is_valid_location(location):
+                    continue
+
+                job_path = job.get("job_path") or ""
+                normalized.append(
+                    {
+                        "company": name,
+                        "company_slug": name,
+                        "title": title,
+                        "location": location[:50],
+                        "url": f"https://amazon.jobs{job_path}",
+                        "updated_at": _amazon_parse_date(job.get("posted_date")),
+                        "is_recruiter": is_recruiter_company(name),
+                        "ats": "Amazon",
+                        **get_job_metadata(),
+                    }
+                )
+
+            offset += page_size
+            if offset >= total or len(jobs) < page_size:
+                break
+            time.sleep(random.uniform(0.4, 1.0))
+
+        return name, normalized
+
+    except Exception:
+        return slug, []
+
+
 def fetch_all_jobs(companies, fetcher, platform="ATS"):
     """Fetch jobs from all companies in parallel."""
     print("=" * 80)
@@ -1547,7 +1654,7 @@ def save_results(all_companies, active_companies, all_jobs):
         "total_jobs": len(all_jobs),
         "recruiter_jobs": recruiter_jobs,
         "source_type": SOURCE_TYPE,
-        "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, workdaysite_api, oracle_api, smartrecruiters_api, icims_html_scraper, clearcompany_api, generic_html_scraper",
+        "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, workdaysite_api, oracle_api, smartrecruiters_api, icims_html_scraper, clearcompany_api, amazon_jobs_api, generic_html_scraper",
     }
 
     metadata_file = os.path.join(OUTPUT_DIR, "metadata.json")
@@ -1581,6 +1688,7 @@ def main():
     smartrecruiters_companies = load_companies(SMARTRECRUITERS_FILE)
     icims_companies = load_companies(ICIMS_FILE)
     clearcompany_companies = load_companies(CLEARCOMPANY_FILE)
+    amazon_companies = load_companies(AMAZON_FILE)
 
     if (
         not greenhouse_companies
@@ -1594,6 +1702,7 @@ def main():
         and not smartrecruiters_companies
         and not icims_companies
         and not clearcompany_companies
+        and not amazon_companies
     ):
         print("Exiting - no companies loaded!")
         return
@@ -1621,6 +1730,8 @@ def main():
 
     active_clearcompany, jobs_clearcompany = fetch_all_jobs(clearcompany_companies, fetch_company_jobs_clearcompany, "CLEARCOMPANY")
 
+    active_amazon, jobs_amazon = fetch_all_jobs(amazon_companies, fetch_company_jobs_amazon, "AMAZON")
+
     # Combine results
     all_companies = (
         greenhouse_companies
@@ -1634,6 +1745,7 @@ def main():
         | smartrecruiters_companies
         | icims_companies
         | clearcompany_companies
+        | amazon_companies
     )
     all_active_companies = {
         **active_greenhouse,
@@ -1647,8 +1759,9 @@ def main():
         **active_smartrecruiters,
         **active_icims,
         **active_clearcompany,
+        **active_amazon,
     }
-    all_jobs_OG = jobs_greenhouse + jobs_ashby + jobs_bamboohr + jobs_lever + jobs_workday + jobs_workdaysite + jobs_oracle + jobs_misc + jobs_smartrecruiters + jobs_icims + jobs_clearcompany
+    all_jobs_OG = jobs_greenhouse + jobs_ashby + jobs_bamboohr + jobs_lever + jobs_workday + jobs_workdaysite + jobs_oracle + jobs_misc + jobs_smartrecruiters + jobs_icims + jobs_clearcompany + jobs_amazon
     all_jobs = []
     
     # Filter all_jobs to include only jobs from the last 30 days

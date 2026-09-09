@@ -86,6 +86,7 @@ class JobBoardApp {
                         'oracle': 'info',
                         'smartrecruiters': 'danger',
                         'clearcompany': 'success',
+                        'amazon': 'warning',
                         'unknown': 'primary'
                     }
                     const color = colors[ats.toLowerCase()] || 'light';
