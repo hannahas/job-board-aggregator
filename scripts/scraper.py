@@ -168,6 +168,49 @@ def fetch_company_jobs_greenhouse(slug):
     return slug, []
 
 
+# Skip per-job date enrichment above this many postings (keeps request count sane).
+ASHBY_MAX_DETAIL_FETCH = 400
+
+
+def _ashby_fetch_published_date(job):
+    """Read `publishedDate` for one Ashby posting into `job["updated_at"]`.
+
+    The board list query (ApiJobBoardWithTeams) only returns brief records with
+    no dates; the per-posting ApiJobPosting query exposes `publishedDate`.
+    Consumes the private "_ashby_org" / "_ashby_id" keys set by the caller.
+    """
+    org = job.pop("_ashby_org", None)
+    job_id = job.pop("_ashby_id", None)
+    if not org or not job_id:
+        return job
+    try:
+        resp = requests.post(
+            "https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobPosting",
+            json={
+                "operationName": "ApiJobPosting",
+                "variables": {
+                    "organizationHostedJobsPageName": org,
+                    "jobPostingId": job_id,
+                },
+                "query": "query ApiJobPosting($organizationHostedJobsPageName: String!, $jobPostingId: String!) { jobPosting(organizationHostedJobsPageName: $organizationHostedJobsPageName, jobPostingId: $jobPostingId) { id publishedDate } }",
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": random.choice(USER_AGENTS),
+            },
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            jp = (resp.json().get("data") or {}).get("jobPosting") or {}
+            posted = jp.get("publishedDate")
+            if posted:
+                job["updated_at"] = parse_relative_date(posted)
+    except Exception:
+        pass
+    return job
+
+
 def fetch_company_jobs_ashby(slug):
     try:
         url = f"https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobBoardWithTeams"
@@ -195,19 +238,29 @@ def fetch_company_jobs_ashby(slug):
                     location = job.get("locationName", "Not specified")
                     if not is_valid_location(location):
                         continue
-                    normalized.append(
-                        {
-                            "company": slug,
-                            "company_slug": slug,
-                            "title": job.get("title", ""),
-                            "location": location,
-                            "updated_at": None,
-                            "url": f"https://jobs.ashbyhq.com/{slug}/{job.get('id')}",
-                            "is_recruiter": is_recruiter_company(slug),
-                            "ats": "Ashby",
-                            **get_job_metadata()
-                        }
-                    )
+                    entry = {
+                        "company": slug,
+                        "company_slug": slug,
+                        "title": job.get("title", ""),
+                        "location": location,
+                        "updated_at": None,
+                        "url": f"https://jobs.ashbyhq.com/{slug}/{job.get('id')}",
+                        "is_recruiter": is_recruiter_company(slug),
+                        "ats": "Ashby",
+                        **get_job_metadata()
+                    }
+                    entry["_ashby_org"] = slug
+                    entry["_ashby_id"] = job.get("id")
+                    normalized.append(entry)
+
+                # The list query has no dates; pull `publishedDate` per posting.
+                if 0 < len(normalized) <= ASHBY_MAX_DETAIL_FETCH:
+                    with ThreadPoolExecutor(max_workers=8) as executor:
+                        list(executor.map(_ashby_fetch_published_date, normalized))
+                for entry in normalized:
+                    entry.pop("_ashby_org", None)
+                    entry.pop("_ashby_id", None)
+
                 return slug, normalized
     except Exception as e:
         pass
