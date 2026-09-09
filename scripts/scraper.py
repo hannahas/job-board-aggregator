@@ -348,6 +348,42 @@ def fetch_company_jobs_lever(slug):
     return slug, []
 
 
+# Some Workday tenants (e.g. Vertex) omit `postedOn` from the jobs list; for
+# those we hit the per-job detail endpoint. Cap the per-company enrichment.
+WORKDAY_MAX_DETAIL_FETCH = 400
+
+
+def _workday_fetch_posted_date(args):
+    """Fetch one Workday job's detail record and read a date into updated_at.
+
+    Only called for entries whose list record had no `postedOn`. The detail
+    endpoint's jobPostingInfo carries `startDate` (ISO) and `postedOn`
+    (relative). Consumes the private "_wd_path" / "_wd_cxs" keys.
+    """
+    entry = args
+    path = entry.pop("_wd_path", None)
+    cxs_base = entry.pop("_wd_cxs", None)
+    if not path or not cxs_base:
+        return entry
+    try:
+        resp = requests.get(
+            f"{cxs_base}{path}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": random.choice(USER_AGENTS),
+            },
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            info = resp.json().get("jobPostingInfo") or {}
+            posted = info.get("startDate") or info.get("postedOn")
+            if posted:
+                entry["updated_at"] = parse_relative_date(posted)
+    except Exception:
+        pass
+    return entry
+
+
 def fetch_company_jobs_workday(slug):
     """
     slug format: "company|wd#|site_id[|display_name]"
@@ -429,19 +465,21 @@ def fetch_company_jobs_workday(slug):
                 location = job.get("locationsText", "Not specified")
                 if not is_valid_location(location):
                     continue
-                normalized.append(
-                    {
-                        "company": display_name,
-                        "company_slug": slug,
-                        "title": job.get("title"),
-                        "location": job.get("locationsText", "Not specified") [:50],
-                        "url": f"{career_url}{job_path}",
-                        "updated_at": posted_on_parsed,
-                        "is_recruiter": is_recruiter_company(company),
-                        "ats": "Workday",
-                        **get_job_metadata()
-                    }
-                )
+                entry = {
+                    "company": display_name,
+                    "company_slug": slug,
+                    "title": job.get("title"),
+                    "location": job.get("locationsText", "Not specified") [:50],
+                    "url": f"{career_url}{job_path}",
+                    "updated_at": posted_on_parsed,
+                    "is_recruiter": is_recruiter_company(company),
+                    "ats": "Workday",
+                    **get_job_metadata()
+                }
+                if posted_on_parsed is None and job_path:
+                    entry["_wd_path"] = job_path
+                    entry["_wd_cxs"] = f"{base_url}/wday/cxs/{company}/{site_id}"
+                normalized.append(entry)
             # List possible queries from job
 
             offset += limit
@@ -451,6 +489,15 @@ def fetch_company_jobs_workday(slug):
 
             # Jitter between pages (critical)
             time.sleep(random.uniform(0.8, 1.8))
+
+        # Backfill dates for tenants that don't return `postedOn` in the list.
+        undated = [e for e in normalized if e.get("_wd_path")]
+        if 0 < len(undated) <= WORKDAY_MAX_DETAIL_FETCH:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(_workday_fetch_posted_date, undated))
+        for e in normalized:
+            e.pop("_wd_path", None)
+            e.pop("_wd_cxs", None)
 
         return display_name, normalized
 
