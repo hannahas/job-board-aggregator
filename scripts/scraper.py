@@ -349,16 +349,19 @@ def fetch_company_jobs_lever(slug):
 
 def fetch_company_jobs_workday(slug):
     """
-    slug format: "company|wd#|site_id" e.g. "kohls|wd1|kohlscareers"
+    slug format: "company|wd#|site_id[|display_name]"
+      e.g. "kohls|wd1|kohlscareers"
+           "gh|wd1|gh|guardant"   (4th field overrides the board name shown/filtered on)
     url: https://{company}.wd{num}.myworkdayjobs.com/wday/cxs/{company}/{site_id}/jobs
     """
 
     try:
         parts = slug.split("|")
-        if len(parts) != 3:
+        if len(parts) not in (3, 4):
             return slug, []
 
-        company, wd, site_id = parts
+        company, wd, site_id = parts[:3]
+        display_name = parts[3].strip() if len(parts) == 4 and parts[3].strip() else company
         wd_num = wd.replace("wd", "")
 
         base_url = f"https://{company}.wd{wd_num}.myworkdayjobs.com"
@@ -427,7 +430,7 @@ def fetch_company_jobs_workday(slug):
                     continue
                 normalized.append(
                     {
-                        "company": company,
+                        "company": display_name,
                         "company_slug": slug,
                         "title": job.get("title"),
                         "location": job.get("locationsText", "Not specified") [:50],
@@ -439,7 +442,7 @@ def fetch_company_jobs_workday(slug):
                     }
                 )
             # List possible queries from job
-            
+
             offset += limit
 
             if offset >= total:
@@ -448,7 +451,7 @@ def fetch_company_jobs_workday(slug):
             # Jitter between pages (critical)
             time.sleep(random.uniform(0.8, 1.8))
 
-        return company, normalized
+        return display_name, normalized
 
     except Exception:
         return slug, []
